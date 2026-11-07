@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Z1 V3 articulated CAD demonstration, SI units throughout."""
+import argparse
+import json
+import math
+from pathlib import Path
+import time
+
+import pybullet as p
+
+ROOT = Path(__file__).resolve().parent
+DT = 1 / 240
+ARM = [0, 1, 2, 3]
+FINGERS = [4, 5]
+TOOL = 6
+BASE_Z = 0.052
+TABLE_TOP = 0.060
+
+
+def box(half, position, mass, color):
+    collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=half)
+    visual = p.createVisualShape(p.GEOM_BOX, halfExtents=half, rgbaColor=color)
+    return p.createMultiBody(mass, collision, visual, position)
+
+
+class Simulation:
+    def __init__(self, gui):
+        self.gui = gui
+        p.connect(p.GUI if gui else p.DIRECT)
+        p.setGravity(0, 0, -9.81)
+        p.setTimeStep(DT)
+        p.setPhysicsEngineParameter(numSolverIterations=150)
+        box([.5, .5, .005], [0, 0, -.005], 0, [.12, .16, .21, 1])
+        self.table = box([.028, .028, TABLE_TOP / 2],
+                         [-.2, 0, TABLE_TOP / 2], 0, [.4, .45, .5, 1])
+        self.robot = p.loadURDF(str(ROOT / 'z1.urdf'), [0, 0, BASE_Z],
+                               useFixedBase=True)
+        self.cube = box([.0075] * 3, [-.2, 0, TABLE_TOP + .0075],
+                        .050, [1, .58, .12, 1])
+        p.changeDynamics(self.cube, -1, lateralFriction=.8, restitution=0)
+        for link in FINGERS:
+            p.changeDynamics(self.robot, link, lateralFriction=.8,
+                             spinningFriction=.001, restitution=0)
+        self.arm = [0.0] * 4
+        self.closure = 0.0
+        self.time = 0.0
+        self.max_height = TABLE_TOP + .0075
+        if gui:
+            p.resetDebugVisualizerCamera(.5, 125, -25, [-.10, 0, .10])
+            p.addUserDebugText('Robot Z1 V3 | Tam voi 200 mm | Vat 50 g', [-.25, .07, .20],
+                              [1, 1, 1], 1.1)
+            p.addUserDebugLine([0, -.07, .005], [-.2, -.07, .005],
+                              [1, .7, .1], 2)
+            p.addUserDebugText('200 mm', [-.13, -.075, .008], [1, .7, .1])
+
+    def step(self):
+        for index, target in zip(ARM, self.arm):
+            p.setJointMotorControl2(self.robot, index, p.POSITION_CONTROL,
+                                   targetPosition=target,
+                                   force=[1, 1, 1, .15][index],
+                                   maxVelocity=1.0, positionGain=.12)
+        for index in FINGERS:
+            p.setJointMotorControl2(self.robot, index, p.POSITION_CONTROL,
+                                   targetPosition=self.closure, force=5,
+                                   maxVelocity=.015, positionGain=.1)
+        p.stepSimulation()
+        self.time += DT
+        self.max_height = max(self.max_height,
+                              p.getBasePositionAndOrientation(self.cube)[0][2])
+        if self.gui:
+            time.sleep(DT)
+
+    def run_for(self, duration):
+        for _ in range(round(duration / DT)):
+            self.step()
+
+    def move(self, xyz, duration=2.0):
+        start = p.getLinkState(self.robot, TOOL, computeForwardKinematics=True)[4]
+        for frame in range(1, round(duration / DT) + 1):
+            fraction = frame / round(duration / DT)
+            weight = fraction * fraction * (3 - 2 * fraction)
+            target = [a + weight * (b - a) for a, b in zip(start, xyz)]
+            # Hold the wrist's reference orientation to keep both contact pads level.
+            solution = p.calculateInverseKinematics(
+                self.robot, TOOL, target, [0, 0, 0, 1],
+                maxNumIterations=100, residualThreshold=1e-6)
+            self.arm = list(solution[:4])
+            self.step()
+
+    def demo(self):
+        initial = list(p.getBasePositionAndOrientation(self.cube)[0])
+        grasp_z = TABLE_TOP + .0075
+        self.run_for(.5)
+        self.move([-.2, 0, grasp_z + .040])
+        self.move([-.2, 0, grasp_z], 2)
+        for frame in range(240):
+            self.closure = .006 * (frame + 1) / 240
+            self.step()
+        contacts = {
+            str(i): bool(p.getContactPoints(self.robot, self.cube, linkIndexA=i))
+            for i in FINGERS
+        }
+        self.move([-.2, 0, grasp_z + .04], 3)
+        held = []
+        grip_contacts = []
+        lateral_errors = []
+        for frame in range(720):
+            self.step()
+            if frame % 24 == 0:
+                position = p.getBasePositionAndOrientation(self.cube)[0]
+                held.append(position[2])
+                lateral_errors.append(math.hypot(position[0] + .2, position[1]))
+                grip_contacts.append(all(
+                    p.getContactPoints(self.robot, self.cube, linkIndexA=i)
+                    for i in FINGERS))
+        minimum_height = min(held)
+        result = {
+            'mode': 'approximate_contact_physics',
+            'payload_kg': .050,
+            'target_radius_m': .200,
+            'cube_side_m': .015,
+            'table_top_m': TABLE_TOP,
+            'initial_cube_center_m': initial,
+            'bilateral_contact_before_lift': all(contacts.values()),
+            'maximum_cube_center_height_m': self.max_height,
+            'minimum_cube_center_during_3s_hold_m': minimum_height,
+            'bilateral_contact_throughout_hold': all(grip_contacts),
+            'maximum_lateral_error_during_hold_m': max(lateral_errors),
+            'lift_held_3s': (all(contacts.values()) and all(grip_contacts)
+                             and minimum_height > grasp_z + .015
+                             and max(lateral_errors) < .015),
+            'assumptions': [
+                'Link masses and motor torque limits are estimates.',
+                'Finger translation and flat pads approximate the CAD linkage.',
+                'Self collision is disabled. Collision geometry is simplified.',
+                'No adhesive or fixed attachment is used to hold the payload.',
+                'Joint limits need calibration against actual servos.'
+            ]
+        }
+        print(json.dumps(result, indent=2))
+        (ROOT / 'last_result.json').write_text(json.dumps(result, indent=2))
+        if self.gui:
+            status = 'GIU VAT THANH CONG (mo hinh gan dung)' if result['lift_held_3s'] else 'NANG VAT THAT BAI'
+            p.addUserDebugText(status, [-.25, .07, .18], [1, 1, 1], 1)
+        return result
+
+    def manual(self):
+        # Hide unused camera previews and frame the robot.
+        p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0)
+        p.configureDebugVisualizer(p.COV_ENABLE_DEPTH_BUFFER_PREVIEW, 0)
+        p.configureDebugVisualizer(
+            p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0
+        )
+        p.resetDebugVisualizerCamera(
+            .45, 125, -25, [-.10, 0, .10]
+        )
+
+        # Start by holding the actual joint positions.
+        self.arm = [
+            p.getJointState(self.robot, index)[0] for index in ARM
+        ]
+        names = ["Xoay de (do)", "Khop vai (do)",
+                 "Khop khuyu (do)", "Co tay (do)"]
+        sliders = []
+        for index, name, angle in zip(ARM, names, self.arm):
+            info = p.getJointInfo(self.robot, index)
+            lower, upper = info[8], info[9]
+            if lower >= upper:
+                lower, upper = -math.pi, math.pi
+            sliders.append(p.addUserDebugParameter(
+                name, math.degrees(lower), math.degrees(upper),
+                math.degrees(angle)
+            ))
+
+        grip = p.addUserDebugParameter(
+            "Do dong kep (mm)", 0, 8, self.closure * 1000
+        )
+        stop_delay = 0.10
+        last_values = [
+            math.radians(p.readUserDebugParameter(s))
+            for s in sliders
+        ]
+        last_change = [time.monotonic()] * len(ARM)
+        holding = [True] * len(ARM)
+
+        print("\nDIEU KHIEN THU CONG")
+        print("Keo thanh truot de di chuyen tung khop.")
+        print("Ngung keo 0.10 giay de giu goc hien tai.")
+        print("Gia tri thanh truot la goc lenh, co the khac goc dang giu.")
+        print("R: dat lai vat | C: dat lai goc nhin | Q: thoat")
+        print("Bam vao cua so mo phong truoc khi dung phim tat.\n")
+
+        while p.isConnected():
+            keys = p.getKeyboardEvents()
+            if keys.get(ord('q'), 0) & p.KEY_WAS_TRIGGERED:
+                break
+
+            if keys.get(ord('c'), 0) & p.KEY_WAS_TRIGGERED:
+                p.resetDebugVisualizerCamera(
+                    .45, 125, -25, [-.10, 0, .10]
+                )
+
+            if keys.get(ord('r'), 0) & p.KEY_WAS_TRIGGERED:
+                p.resetBasePositionAndOrientation(
+                    self.cube,
+                    [-.2, 0, TABLE_TOP + .0075],
+                    [0, 0, 0, 1]
+                )
+                p.resetBaseVelocity(
+                    self.cube, [0, 0, 0], [0, 0, 0]
+                )
+
+            now = time.monotonic()
+            values = [
+                math.radians(p.readUserDebugParameter(s))
+                for s in sliders
+            ]
+
+            # Each arm joint stops independently.
+            for slot, index in enumerate(ARM):
+                if abs(values[slot] - last_values[slot]) > 1e-6:
+                    self.arm[slot] = values[slot]
+                    last_values[slot] = values[slot]
+                    last_change[slot] = now
+                    holding[slot] = False
+                elif (not holding[slot]
+                      and now - last_change[slot] >= stop_delay):
+                    self.arm[slot] = p.getJointState(
+                        self.robot, index
+                    )[0]
+                    holding[slot] = True
+
+            # Keep gripper position control so it can retain the object.
+            self.closure = p.readUserDebugParameter(grip) / 1000
+            self.step()
+
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--headless', action='store_true',
+                        help='Run the automatic trial without opening a window')
+    parser.add_argument('--manual', action='store_true',
+                        help='Start with manual joint controls')
+    args = parser.parse_args()
+    if args.headless and args.manual:
+        parser.error('--manual requires the graphical window')
+    sim = Simulation(gui=not args.headless)
+    try:
+        if not args.manual:
+            sim.demo()
+        if not args.headless:
+            sim.manual()
+    finally:
+        p.disconnect()
+
+
+if __name__ == '__main__':
+    main()

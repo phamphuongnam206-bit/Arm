@@ -1,0 +1,25 @@
+{
+  "mode": "approximate_contact_physics",
+  "payload_kg": 0.05,
+  "target_radius_m": 0.2,
+  "cube_side_m": 0.015,
+  "table_top_m": 0.06,
+  "initial_cube_center_m": [
+    -0.2,
+    0.0,
+    0.0675
+  ],
+  "bilateral_contact_before_lift": true,
+  "maximum_cube_center_height_m": 0.1072885827674772,
+  "minimum_cube_center_during_3s_hold_m": 0.10708946745836276,
+  "bilateral_contact_throughout_hold": true,
+  "maximum_lateral_error_during_hold_m": 0.0005425097610936993,
+  "lift_held_3s": true,
+  "assumptions": [
+    "Link masses and motor torque limits are estimates.",
+    "Finger translation and flat pads approximate the CAD linkage.",
+    "Self collision is disabled. Collision geometry is simplified.",
+    "No adhesive or fixed attachment is used to hold the payload.",
+    "Joint limits need calibration against actual servos."
+  ]
+}
